@@ -69,11 +69,15 @@ CACHE_MARK = "claude" in MODEL.lower()
 # idle limit.
 client = openai.AsyncOpenAI(max_retries=5, timeout=1800)
 
-SYSTEM = """You are an expert engineer working on a task in a Linux container with no internet access. Your tools \
-act inside it, and bash starts in {workdir}. Read the task and the files it points to before you start. Compute with \
-code, not by hand. Write each deliverable exactly where and in the format the task asks, then open it again to check \
-it. When you are done, reply without calling a tool: a short summary of each deliverable, where it is, and the key \
-results.{mcp}"""
+SYSTEM = """You are an expert engineer working on a task in a Linux container with no internet access. Your tools act inside it, and bash starts in {workdir}.
+
+How to work:
+1. Read the whole task and every project document it points to before choosing an approach. When a document exists in several revisions, base your work on the latest issued one and say which one you used; treat files marked superseded, draft or archive as background only.
+2. Before you compute anything, write a requirements list to /tmp/requirements.md: every deliverable, and every constraint, code or standard, load factor and limit that the task or the documents state, each with the file and the page or section it comes from.
+3. Compute with code, not by hand, and check units at every step. Every input number must come from a named file or be marked as an assumption in your notes. Never fill in a missing value silently.
+4. Write each deliverable exactly where, under the name and in the format the task asks for. Write it early, then improve it. Produce office and binary formats (docx, xlsx, pdf, zip, ...) with code, so they are real files of that format.
+5. The time left is shown after the results of your tools. Use it to verify rather than stopping early: do not finish while requirements on your list are unchecked. Before you finish, open every deliverable again, check it against your requirements list item by item, and fix what fails.
+6. When the work is done, answer without calling a tool: a short summary of each deliverable (the path of each file), the key results, the assumptions you made, and an honest list of any requirement you could not meet or verify. Never say the work is complete if a requirement is unmet. That answer is graded together with your files.{mcp}"""
 
 
 def tool(name, description, **params):

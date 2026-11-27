@@ -73,7 +73,7 @@ SYSTEM = """You are an expert engineer working on a task in a Linux container wi
 act inside it, and bash starts in {workdir}. Read the task and the files it points to before you start. Compute with \
 code, not by hand. Write each deliverable exactly where and in the format the task asks, then open it again to check \
 it. When you are done, reply without calling a tool: a short summary of each deliverable, where it is, and the key \
-results."""
+results.{mcp}"""
 
 
 def tool(name, description, **params):
@@ -115,6 +115,178 @@ TOOLS = [
         content="string",
     ),
 ]
+
+
+# --- MCP support, adapted from sample_submissions/custom-openai/serve.py
+# (Apache-2.0). Tools the task serves over MCP (documents, spreadsheets,
+# email, CAD) are offered to the model as functions.
+DIRECT_MCP_CHARS = 40_000  # offer MCP tools directly up to this much JSON
+MAX_TOOLS = 128  # functions one request may offer, the built-in ones included
+MCP_DIRECT = (
+    "\n\nThe task also offers its own tools (the functions named"
+    " <server>__<tool>)."
+)
+MCP_CATALOG = (
+    "\n\nThe task also offers its own tools, listed below by server. Call"
+    " mcp_find to see a tool's parameters, then mcp_call to run it.\n{catalog}"
+)
+MCP_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "mcp_find",
+            "description": (
+                "Show the description and parameters of the task's own tools"
+                " that match a query."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "A tool name, or words describing what you need.",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mcp_call",
+            "description": "Run one of the task's own tools.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool": {
+                        "type": "string",
+                        "description": "The tool's name as listed.",
+                    },
+                    "arguments": {"type": "object"},
+                },
+                "required": ["tool", "arguments"],
+            },
+        },
+    },
+]
+
+
+class MCPServer(taskbridge.MCPClient):
+  """Client for one task MCP server and its discovered tools."""
+
+  def __init__(self, session, spec):
+    super().__init__(session, spec["url"], client="custom-harness")
+    self.name = spec["name"]
+    self.tools = []
+
+  async def start(self):
+    await self.initialize()
+    self.tools = await self.list_tools()
+
+  async def call(self, name, arguments):
+    result = await self.call_tool(name, arguments)
+    parts = []
+    content = (
+        result.get("content") if isinstance(result.get("content"), list) else []
+    )
+    for item in content:
+      kind = item.get("type") if isinstance(item, dict) else None
+      if kind == "text":
+        parts.append(str(item.get("text", "")))
+      elif kind in ("resource", "resource_link"):
+        parts.append(json.dumps(item)[:RESULT_CHARS])
+      else:
+        parts.append(f"[{kind or 'unknown'} content not shown]")
+    if not parts and result.get("structuredContent") is not None:
+      parts.append(json.dumps(result["structuredContent"]))
+    text = "\n".join(parts) or "(no content)"
+    return f"error: {text}" if result.get("isError") else text
+
+
+def unique_name(name, taken):
+  candidate, n = name[:64], 1
+  while candidate in taken:
+    n += 1
+    suffix = f"_{n}"
+    candidate = name[: 64 - len(suffix)] + suffix
+  return candidate
+
+
+async def connect_mcp(session):
+  """Connects to the task's MCP servers; returns (tools map, functions, note)."""
+  mcp = {}
+  for spec in session.mcp_servers:
+    server = MCPServer(session, spec)
+    try:
+      await server.start()
+    except (taskbridge.TaskError, RuntimeError, ValueError) as exc:
+      await session.log(f"MCP server {server.name} unavailable: {exc}")
+      continue
+    for t in server.tools:
+      name = re.sub(r"[^A-Za-z0-9_-]", "_", f"{server.name}__{t['name']}")
+      mcp[unique_name(name, mcp)] = (server, t)
+    await session.log(f"MCP server {server.name}: {len(server.tools)} tools")
+  if not mcp:
+    return {}, [], ""
+  functions = [
+      {
+          "type": "function",
+          "function": {
+              "name": name,
+              "description": (t.get("description") or t["name"])[:1024],
+              "parameters": (
+                  {
+                      k: v
+                      for k, v in (t.get("inputSchema") or {}).items()
+                      if k != "$schema"
+                  }
+                  or {"type": "object", "properties": {}}
+              ),
+          },
+      }
+      for name, (_, t) in mcp.items()
+  ]
+  if (
+      len(json.dumps(functions)) <= DIRECT_MCP_CHARS
+      and len(TOOLS) + len(functions) <= MAX_TOOLS
+  ):
+    return mcp, functions, MCP_DIRECT
+  servers = {}
+  for name, (server, _) in mcp.items():
+    servers.setdefault(server.name, []).append(name)
+  catalog = "\n".join(f"{s}: {', '.join(n)}" for s, n in servers.items())
+  return mcp, MCP_TOOLS, MCP_CATALOG.format(catalog=catalog)
+
+
+def find_mcp(mcp, query):
+  """Describes the MCP tools that best match `query`."""
+  words = [w for w in re.split(r"[^a-z0-9]+", query.lower()) if w]
+
+  def score(item):
+    name, (_, t) = item
+    text = f"{name} {t.get('description') or ''}".lower()
+    return (
+        (query == name) * 100
+        + sum(w in name.lower() for w in words) * 3
+        + sum(w in text for w in words)
+    )
+
+  best = [
+      item
+      for item in sorted(mcp.items(), key=score, reverse=True)[:8]
+      if score(item) > 0
+  ]
+  if not best:
+    return f"no tool matches {query!r}; the names are listed in the system prompt"
+  found = [
+      f"{name}: {(t.get('description') or '')[:400]}\nparameters:"
+      f" {json.dumps(t.get('inputSchema') or {})}"
+      for name, (_, t) in best
+  ]
+  while len(found) > 1 and len("\n\n".join(found)) > RESULT_CHARS:
+    found.pop()
+  return "\n\n".join(found)
 
 
 def clip(text):
@@ -167,7 +339,7 @@ def marked(messages):
   return out
 
 
-async def run_tool(session, fn):
+async def run_tool(session, fn, mcp=None):
   """Executes a single tool call in the task container and returns its output.
 
   Rewrites `fn["arguments"]` as canonical JSON (or `"{}"` if invalid) so the
@@ -194,6 +366,16 @@ async def run_tool(session, fn):
         " again"
     )
   try:
+    if mcp and name == "mcp_call":
+      name, args = str(args.get("tool", "")), args.get("arguments") or {}
+      args = json.loads(args) if isinstance(args, str) else args
+      if name not in mcp:
+        return f"error: no tool named {name!r}; use mcp_find"
+    if mcp and name in mcp:
+      server, t = mcp[name]
+      return clip(await server.call(t["name"], args))
+    if mcp and name == "mcp_find":
+      return clip(find_mcp(mcp, str(args.get("query", ""))))
     if name == "bash":
       result = await session.exec(args["command"])
       return clip(f"exit code {result['exit_code']}\n{result['output']}")
@@ -208,7 +390,7 @@ async def run_tool(session, fn):
       )
     return f"error: there is no tool named {name}"
   # ValueError: content with an unpaired surrogate
-  except (taskbridge.TaskError, KeyError, ValueError) as exc:
+  except (taskbridge.TaskError, KeyError, ValueError, RuntimeError) as exc:
     return f"error: {type(exc).__name__}: {exc}"
 
 
@@ -288,8 +470,10 @@ async def solve(session):
   Returns:
     The final summary message from the model.
   """
+  mcp, extra_tools, note = await connect_mcp(session)
+  tools = TOOLS + extra_tools
   messages = [
-      {"role": "system", "content": SYSTEM.format(workdir=session.workdir)},
+      {"role": "system", "content": SYSTEM.format(workdir=session.workdir, mcp=note)},
       {"role": "user", "content": session.instruction},
   ]
   # head: the start of an answer cut off at the output limit
@@ -304,7 +488,7 @@ async def solve(session):
           client.chat.completions.create(
               model=MODEL,
               messages=marked(messages),
-              tools=TOOLS,
+              tools=tools,
               tool_choice="none" if wrap_up else "auto",
               reasoning_effort=EFFORT,
               max_completion_tokens=MAX_OUTPUT_TOKENS,
@@ -359,7 +543,7 @@ async def solve(session):
       await session.log(
           f"{call['function']['name']} {call['function']['arguments'][:200]}"
       )
-      content = await run_tool(session, call["function"])
+      content = await run_tool(session, call["function"], mcp)
       messages.append(
           {"role": "tool", "tool_call_id": call["id"], "content": content}
       )

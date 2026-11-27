@@ -23,6 +23,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 
 import openai
 import taskbridge
@@ -293,6 +294,46 @@ def find_mcp(mcp, query):
   return "\n\n".join(found)
 
 
+# --- Deliverable guard: before finishing, check that the files the task
+# instruction names by absolute path exist.
+MAX_GUARDS = 2  # how many times the model is sent back at most
+PATH_RE = re.compile(
+    r"(?<![:\w/])(/[A-Za-z0-9_.\-]+(?:/[A-Za-z0-9_.\-]+)*"
+    r"\.[A-Za-z0-9]{1,6})(?![A-Za-z0-9_/])"
+)
+GUARD_NOTE = (
+    "Before you finish: the task names these files, and they do not exist at"
+    " those exact paths yet:\n{files}\n"
+    "If one of them is a deliverable, create it at exactly that path now."
+    " Use absolute paths: each bash command starts in a new shell, so a cd or"
+    " chdir in an earlier command does not carry over. Use ls or find to learn"
+    " where your output actually went. If a file is not a deliverable, say so"
+    " in your final answer, then finish."
+)
+
+
+def instruction_paths(text):
+  """Absolute file paths mentioned in the task instruction, without repeats."""
+  found = []
+  for p in PATH_RE.findall(text or ""):
+    if p not in found:
+      found.append(p)
+  return found[:40]
+
+
+async def missing_paths(session, paths):
+  """The paths among `paths` that do not exist in the task container."""
+  missing = []
+  for p in paths:
+    try:
+      result = await session.exec(f"test -e {shlex.quote(p)}")
+    except taskbridge.TaskError:
+      continue
+    if result["exit_code"] != 0:
+      missing.append(p)
+  return missing
+
+
 def clip(text):
   """Truncates `text` in the middle if it exceeds `RESULT_CHARS` characters.
 
@@ -482,6 +523,7 @@ async def solve(session):
   ]
   # head: the start of an answer cut off at the output limit
   nudges, head, waits = 0, "", iter(RETRY_WAITS)
+  guards, wanted = 0, instruction_paths(session.instruction)
   while True:
     left = session.time_left()  # None when the task has no time limit
     wrap_up = left is not None and left < WRAP_UP_SEC
@@ -527,6 +569,25 @@ async def solve(session):
     # endpoint's own fields.
     turn = message.model_dump(exclude_none=True)
     if wrap_up or not message.tool_calls:
+      if (
+          not wrap_up
+          and message.content
+          and not cut
+          and guards < MAX_GUARDS
+      ):
+        missing = await missing_paths(session, wanted)
+        if missing:
+          guards += 1
+          await session.log(
+              f"guard: {len(missing)} file(s) named in the task do not exist"
+              " yet"
+          )
+          messages.append(turn)
+          messages.append({
+              "role": "user",
+              "content": GUARD_NOTE.format(files="\n".join(missing[:20])),
+          })
+          continue
       if wrap_up or (message.content and not cut) or nudges == MAX_NUDGES:
         return session.final_message
       nudges, head = nudges + 1, text

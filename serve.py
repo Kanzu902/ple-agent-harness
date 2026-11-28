@@ -334,6 +334,53 @@ async def missing_paths(session, paths):
   return missing
 
 
+# --- Old-result trimming: fewer tokens re-sent at every step.
+TRIM_KEEP_FULL = 6  # the newest tool results are always kept whole
+TRIM_OVER = 3000  # older results longer than this are shortened
+TRIM_HEAD = 1500  # characters of a shortened result that stay in the chat
+TRIM_NOTE = (
+    "\n[... {cut} characters trimmed from this old tool result to save"
+    " tokens; {where}. Read it again with read_file, or search it with grep in"
+    " bash, if you need it.]"
+)
+
+
+async def trim_old_results(session, messages):
+  """Shortens big tool results older than the newest TRIM_KEEP_FULL ones."""
+  old = [n for n, m in enumerate(messages) if m["role"] == "tool"]
+  old = old[:-TRIM_KEEP_FULL]
+  todo = [
+      n
+      for n in old
+      if isinstance(messages[n]["content"], str)
+      and len(messages[n]["content"]) > TRIM_OVER
+  ]
+  if not todo:
+    return
+  try:
+    await session.exec("mkdir -p /tmp/tool_results")
+  except taskbridge.TaskError:
+    pass
+  cut_total = 0
+  for n in todo:
+    content = messages[n]["content"]
+    path = f"/tmp/tool_results/result_{n:04d}.txt"
+    try:
+      await session.write_file(path, content)
+      where = f"the full text is saved at {path}"
+    except (taskbridge.TaskError, ValueError):
+      where = "it was not saved, so run the tool again"
+    cut = len(content) - TRIM_HEAD
+    messages[n]["content"] = content[:TRIM_HEAD] + TRIM_NOTE.format(
+        cut=cut, where=where
+    )
+    cut_total += cut
+  await session.log(
+      f"trim: shortened {len(todo)} old tool result(s), about {cut_total}"
+      " characters"
+  )
+
+
 def clip(text):
   """Truncates `text` in the middle if it exceeds `RESULT_CHARS` characters.
 
@@ -529,6 +576,7 @@ async def solve(session):
     wrap_up = left is not None and left < WRAP_UP_SEC
     if wrap_up and messages[-1:] != [WRAP_UP]:  # asked once, also on a retry
       messages.append(dict(WRAP_UP))
+    await trim_old_results(session, messages)
     try:  # a call still running when the wrap-up starts is stopped
       reply = await asyncio.wait_for(
           client.chat.completions.create(
